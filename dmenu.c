@@ -7,7 +7,7 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
-
+#include <X11/extensions/XInput2.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xproto.h>
@@ -65,6 +65,14 @@ static int bl_h = NotSet;
 static int bl_w = NotSet;
 
 static int useargb = 0;
+static int xi_opcode = -1;
+
+/* состояние указателя/тача */
+static int dragging = 0;
+static int drag_moved = 0;
+static int drag_start_x = 0, drag_start_y = 0;
+static int drag_last_y = 0;
+
 static Visual *visual;
 static int depth;
 static Colormap cmap;
@@ -548,6 +556,144 @@ draw:
 	drawmenu();
 }
 
+static struct item *
+item_at(int x, int y)
+{
+	struct item *it;
+	int iy;
+
+	if (lines > 0) {
+		/* вертикальный список: строка 0 — input, дальше элементы */
+		if (y < bh)
+			return NULL;
+		iy = (y / bh) - 1;
+		if (iy < 0)
+			return NULL;
+		for (it = curr; it && it != next; it = it->right) {
+			if (iy == 0)
+				return it;
+			iy--;
+		}
+		return NULL;
+	} else {
+		/* горизонтальный список */
+		int cx;
+		if (y >= bh)
+			return NULL;
+		cx = promptw + inputw;
+		if (x < cx)
+			return NULL;
+		for (it = curr; it && it != next; it = it->right) {
+			unsigned int w = textw_clamp(it->text, mw - (unsigned int)cx - TEXTW(">"));
+			if (x < cx + (int)w)
+				return it;
+			cx += w;
+		}
+		return NULL;
+	}
+}
+
+/* Подтвердить выбор элемента: вывести и выйти */
+static void
+activate(struct item *it)
+{
+	if (!it)
+		return;
+	sel = it;
+	drawmenu();
+	puts(it->text);
+	cleanup();
+	exit(0);
+}
+
+/* Начать перетаскивание/тап */
+static void
+drag_begin(int x, int y)
+{
+	dragging = 1;
+	drag_moved = 0;
+	drag_start_x = x;
+	drag_start_y = y;
+	drag_last_y = y;
+}
+
+/* Обновление перетаскивания — скролл списка.
+ * Двигаем ТОЛЬКО окно (curr) и, если sel ещё не у края, тянем его за собой,
+ * чтобы выделение оставалось на той же строке экрана. */
+static void
+drag_update(int x, int y)
+{
+	int dy;
+	int changed = 0;
+
+	if (!dragging)
+		return;
+
+	if (abs(x - drag_start_x) > 5 || abs(y - drag_start_y) > 5)
+		drag_moved = 1;
+
+	if (lines <= 0)
+		return;
+
+	dy = y - drag_last_y;
+
+	/* Скролл вниз (палец вверх) */
+	while (dy <= -bh) {
+		if (curr->right) {
+			curr = curr->right;
+			/* тянем sel, если он не упёрся в нижний край видимой области */
+			if (sel && sel->right && sel != next) {
+				sel = sel->right;
+			}
+			calcoffsets();
+			changed = 1;
+		}
+		dy += bh;
+		drag_last_y -= bh;
+		drag_moved = 1;
+	}
+
+	/* Скролл вверх (палец вниз) */
+	while (dy >= bh) {
+		if (curr->left) {
+			curr = curr->left;
+			/* тянем sel, если он не упёрся в верхний край */
+			if (sel && sel->left && sel != prev) {
+				sel = sel->left;
+			}
+			calcoffsets();
+			changed = 1;
+		}
+		dy -= bh;
+		drag_last_y += bh;
+		drag_moved = 1;
+	}
+
+	if (changed)
+		drawmenu();
+}
+
+/* Отпускание: если это был тап — активировать элемент */
+static void
+drag_end(int x, int y)
+{
+	struct item *it;
+
+	if (!dragging)
+		return;
+	dragging = 0;
+
+	if (drag_moved) {
+		drag_moved = 0;
+		return;
+	}
+
+	it = item_at(x, y);
+	if (it)
+		activate(it);
+	drag_moved = 0;
+}
+
 static void
 paste(void)
 {
@@ -599,7 +745,7 @@ run(void)
 	XEvent ev;
 
 	while (!XNextEvent(dpy, &ev)) {
-		if (XFilterEvent(&ev, win))
+		if (ev.type != GenericEvent && XFilterEvent(&ev, win))
 			continue;
 		switch(ev.type) {
 		case DestroyNotify:
@@ -612,7 +758,6 @@ run(void)
 				drw_map(drw, win, 0, 0, mw, mh);
 			break;
 		case FocusIn:
-			/* regrab focus from parent window */
 			if (ev.xfocus.window != win)
 				grabfocus();
 			break;
@@ -626,6 +771,54 @@ run(void)
 		case VisibilityNotify:
 			if (ev.xvisibility.state != VisibilityUnobscured)
 				XRaiseWindow(dpy, win);
+			break;
+
+		/* ---- мышь и эмулированный тач ---- */
+		case ButtonPress:
+			if (ev.xbutton.button == Button1)
+				drag_begin(ev.xbutton.x, ev.xbutton.y);
+			else if (ev.xbutton.button == Button4) { /* колесо вверх */
+				if (sel && sel->left && (sel = sel->left)->right == curr) {
+					curr = prev;
+					calcoffsets();
+				}
+				drawmenu();
+			} else if (ev.xbutton.button == Button5) { /* колесо вниз */
+				if (sel && sel->right && (sel = sel->right) == next) {
+					curr = next;
+					calcoffsets();
+				}
+				drawmenu();
+			}
+			break;
+		case MotionNotify:
+			if (dragging)
+				drag_update(ev.xmotion.x, ev.xmotion.y);
+			break;
+		case ButtonRelease:
+			if (ev.xbutton.button == Button1)
+				drag_end(ev.xbutton.x, ev.xbutton.y);
+			break;
+
+		/* ---- нативный XInput2 тач ---- */
+		case GenericEvent:
+			if (xi_opcode != -1 &&
+			    ev.xcookie.extension == xi_opcode &&
+			    XGetEventData(dpy, &ev.xcookie)) {
+				XIDeviceEvent *xie = (XIDeviceEvent *)ev.xcookie.data;
+				switch (ev.xcookie.evtype) {
+				case XI_TouchBegin:
+					drag_begin((int)xie->event_x, (int)xie->event_y);
+					break;
+				case XI_TouchUpdate:
+					drag_update((int)xie->event_x, (int)xie->event_y);
+					break;
+				case XI_TouchEnd:
+					drag_end((int)xie->event_x, (int)xie->event_y);
+					break;
+				}
+				XFreeEventData(dpy, &ev.xcookie);
+			}
 			break;
 		}
 	}
@@ -656,7 +849,7 @@ setup(void)
 	/* calculate menu geometry */
 	bh = drw->fonts->h + 2;
 	lines = MAX(lines, 0);
-	
+
 	if (bl_h != NotSet) {
 		lines = MIN(bl_h/(bh+1), lines);
 		mh = bl_h;
@@ -670,12 +863,10 @@ setup(void)
 		if (mon >= 0 && mon < n)
 			i = mon;
 		else if (w != root && w != PointerRoot && w != None) {
-			/* find top-level window containing current input focus */
 			do {
 				if (XQueryTree(dpy, (pw = w), &dw, &w, &dws, &du) && dws)
 					XFree(dws);
 			} while (w != root && w != pw);
-			/* find xinerama screen with which the window intersects most */
 			if (XGetWindowAttributes(dpy, pw, &wa))
 				for (j = 0; j < n; j++)
 					if ((a = INTERSECT(wa.x, wa.y, wa.width, wa.height, info[j])) > area) {
@@ -683,7 +874,6 @@ setup(void)
 						i = j;
 					}
 		}
-		/* no focused window is on screen, so use pointer location instead */
 		if (mon < 0 && !area && XQueryPointer(dpy, root, &dw, &dw, &x, &y, &di, &di, &du))
 			for (i = 0; i < n; i++)
 				if (INTERSECT(x, y, 1, 1, info[i]) != 0)
@@ -712,24 +902,45 @@ setup(void)
 		mw = bl_w;
 
 	promptw = (prompt && *prompt) ? TEXTW(prompt) - lrpad / 4 : 0;
-	inputw = mw / 3; /* input width: ~33% of monitor width */
+	inputw = mw / 3;
 	match();
 
 	/* create menu window */
 	swa.override_redirect = True;
-	// swa.background_pixel = scheme[SchemeNorm][ColBg].pixel;
-	
 	swa.background_pixel = 0;
 	swa.border_pixel = 0;
 	swa.colormap = cmap;
-	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask;
+	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask
+	               | ButtonPressMask | ButtonReleaseMask
+	               | PointerMotionMask | ButtonMotionMask
+	               | EnterWindowMask | LeaveWindowMask;
 	win = XCreateWindow(dpy, root, x, y, mw, mh, 0,
-	                    // CopyFromParent, CopyFromParent, CopyFromParent,
-	                    // CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
 	                    depth, CopyFromParent, visual,
 	                    CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap | CWEventMask, &swa);
 	XSetClassHint(dpy, win, &ch);
 
+	/* ==== XInput2: подписка на тач-события (если поддерживается) ==== */
+	{
+		int major = 2, minor = 2, ev_code, err_code;
+		unsigned char mask[(XI_LASTEVENT + 7) / 8];
+		XIEventMask evmask;
+
+		if (XQueryExtension(dpy, "XInputExtension", &xi_opcode, &ev_code, &err_code) &&
+		    XIQueryVersion(dpy, &major, &minor) == Success &&
+		    (major > 2 || (major == 2 && minor >= 2))) {
+			memset(mask, 0, sizeof(mask));
+			XISetMask(mask, XI_TouchBegin);
+			XISetMask(mask, XI_TouchUpdate);
+			XISetMask(mask, XI_TouchEnd);
+			evmask.deviceid = XIAllMasterDevices;
+			evmask.mask_len = sizeof(mask);
+			evmask.mask = mask;
+			XISelectEvents(dpy, win, &evmask, 1);
+		} else {
+			xi_opcode = -1;
+		}
+	}
+	/* ============================================================== */
 
 	/* input methods */
 	if ((xim = XOpenIM(dpy, NULL, NULL, NULL)) == NULL)
